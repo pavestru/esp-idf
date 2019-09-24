@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "freertos/ringbuf.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_system.h"
@@ -107,6 +108,47 @@ static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
     return str;
 }
 
+RingbufHandle_t a2dp_input_buffer;
+
+void setup_a2dp_audio_buffer()
+{
+    a2dp_input_buffer = xRingbufferCreate(8192, RINGBUF_TYPE_BYTEBUF);
+
+  if (a2dp_input_buffer == NULL)
+  {
+    ESP_LOGE("A2DP_RING_BUFFER", "Failed to create a2dp input audio buffer\n");
+    return;
+  }
+}
+
+#define SAMPLE_RATE 44100   // samples per second, one sample = 2 bytes
+#define FRAME_LENGTH_MS 10  // 10 ms
+#define CHANNELS 2
+#define DATA_LEN (2 * SAMPLE_RATE * CHANNELS * FRAME_LENGTH_MS / 1000) // length of data generated in `FRAME_LENGTH_MS` miliseconds
+
+void bt_data_generating_task(void)
+{
+    char data[DATA_LEN];
+    int len = DATA_LEN;
+
+    while(1)
+    {
+        // generate random sequence
+        int val = rand() % (1 << 16);
+        for (int i = 0; i < (len >> 1); i++) {
+            data[(i << 1)] = val & 0xff;
+            data[(i << 1) + 1] = (val >> 8) & 0xff;
+        }
+        // ESP_LOGW("DATA_TAG", "data: %s",(char *)data);
+        UBaseType_t res = xRingbufferSend(a2dp_input_buffer, data, len, 0);
+        if (res != pdTRUE) {
+            ESP_LOGE("DATA", "Failed to send data to the a2dp buffer");
+        }
+
+        vTaskDelay(FRAME_LENGTH_MS / portTICK_PERIOD_MS);
+    }
+}
+
 void app_main(void)
 {
     // Initialize NVS.
@@ -161,6 +203,10 @@ void app_main(void)
     esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
     esp_bt_pin_code_t pin_code;
     esp_bt_gap_set_pin(pin_type, 0, pin_code);
+
+    setup_a2dp_audio_buffer();
+
+    xTaskCreate(&bt_data_generating_task, "Data_gen", 16192, NULL, 5, NULL);
 }
 
 static bool get_name_from_eir(uint8_t *eir, uint8_t *bdname, uint8_t *bdname_len)
@@ -380,14 +426,27 @@ static int32_t bt_app_a2d_data_cb(uint8_t *data, int32_t len)
         return 0;
     }
 
-    // generate random sequence
-    int val = rand() % (1 << 16);
-    for (int i = 0; i < (len >> 1); i++) {
-        data[(i << 1)] = val & 0xff;
-        data[(i << 1) + 1] = (val >> 8) & 0xff;
-    }
+    size_t item_size;
+    char *item = (char *)xRingbufferReceiveUpTo(a2dp_input_buffer, &item_size, 0, len);
 
-    return len;
+    if (item != NULL)
+    {
+        if (item_size < (len))
+        {
+            ESP_LOGI(BT_AV_TAG, "!!!!!Less items in buffer (%d) than required (%d)", item_size, len);
+        }
+        for (int i = 0; i < item_size; i++)
+        {
+            memcpy(data, item, item_size);
+        }
+        vRingbufferReturnItem(a2dp_input_buffer, (void *)item);
+        return item_size;
+    }
+    else
+    {
+        ESP_LOGE(BT_AV_TAG, "Received no data for bluetooth");
+        return 0;
+    }
 }
 
 static void a2d_app_heart_beat(void *arg)
